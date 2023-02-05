@@ -1,0 +1,40 @@
+cabal-version:   3.4
+name:            persistent-dynamodb
+version:         0.1.0.0
+synopsis:        AWS DynamoDB backend for persistent
+license:         BSD-3-Clause
+author:          kokobd
+maintainer:      contact@zelinf.net
+copyright:       Copyright 2023 kokobd
+category:        Database
+build-type:      Simple
+extra-doc-files: CHANGELOG.md
+
+common opts
+  ghc-options:   -Wall
+  build-depends:
+    , amazonka
+    , amazonka-dynamodb
+    , base
+    , persistent
+    , text
+    , bytestring
+
+library
+  import:          opts
+  exposed-modules: MyLib
+  build-depends:
+    , base
+    , persistent
+
+  hs-source-dirs:  src
+
+test-suite persistent-dynamodb-test
+  import:         opts
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs
+  build-depends:
+    , persistent-dynamodb
+    , tasty
+    , tasty-hunit
