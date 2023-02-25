@@ -44,7 +44,6 @@ import qualified Data.Text as T
 import Data.Traversable (forM)
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
-import qualified Data.UUID.V4 as UUID
 import qualified Data.Vector as V
 import Database.Persist
 import Database.Persist.Sql (PersistFieldSql (sqlType))

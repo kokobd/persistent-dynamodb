@@ -35,6 +35,7 @@
                         "java.logging"
                         "java.xml"
                         "java.desktop"
+                        "java.management"
                       ];
                     }; in
                     ''
