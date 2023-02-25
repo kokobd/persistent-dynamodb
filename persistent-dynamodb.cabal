@@ -13,28 +13,45 @@ extra-doc-files: CHANGELOG.md
 common opts
   ghc-options:   -Wall
   build-depends:
+    , aeson
     , amazonka
     , amazonka-dynamodb
     , base
-    , persistent
-    , text
+    , binary
     , bytestring
+    , containers
+    , generic-lens
+    , http-api-data
+    , lens
+    , mtl
+    , path-pieces
+    , persistent
+    , template-haskell
+    , text
+    , time
+    , transformers
+    , unordered-containers
+    , uuid
+    , vector
 
 library
   import:          opts
-  exposed-modules: MyLib
+
+  -- cabal-fmt: expand src/
+  exposed-modules: Database.Persist.DynamoDB
   build-depends:
     , base
     , persistent
 
   hs-source-dirs:  src
 
-test-suite persistent-dynamodb-test
+test-suite tests
   import:         opts
   type:           exitcode-stdio-1.0
   hs-source-dirs: test
   main-is:        Main.hs
   build-depends:
     , persistent-dynamodb
+    , persistent-sqlite
     , tasty
     , tasty-hunit

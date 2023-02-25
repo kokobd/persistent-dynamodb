@@ -12,55 +12,63 @@
   outputs = { self, nixpkgs, flake-utils, haskellNix, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        localDynamoDBSrc = builtins.fetchurl {
-          url = "https://s3.ap-northeast-1.amazonaws.com/dynamodb-local-tokyo/dynamodb_local_latest.tar.gz";
-          sha256 = "sha256:0xim1g97m0kklkqk9573aizac3c70r8vjcv14wn8al3cz7b68da3";
-        };
-
         overlays = [
           haskellNix.overlay
           (final: prev:
-            let localDynamoDB =
-              prev.stdenv.mkDerivation {
-                name = "dynamodb";
-                src = builtins.fetchurl {
-                  url = "https://s3.ap-northeast-1.amazonaws.com/dynamodb-local-tokyo/dynamodb_local_latest.tar.gz";
-                  sha256 = "sha256:0xim1g97m0kklkqk9573aizac3c70r8vjcv14wn8al3cz7b68da3";
-                };
-                buildPhase = ''
-                  mkdir -p $out
-                  cd $out
-                  tar -xf $src
-                '';
-                installPhase =
-                  let jre = prev.jre_minimal.override {
-                    modules = [
-                      "java.base"
-                      "java.logging"
-                      "java.xml"
-                      "java.desktop"
-                    ];
-                  }; in
-                  ''
-                    mkdir -p $out/bin
-                    cat > $out/bin/dynamodb <<EOF
-                      ${jre}/bin/java -Djava.library.path=$out/DynamoDBLocal_lib \
-                        -jar $out/DynamoDBLocal.jar "\$@"
-                    EOF
-                    chmod +x $out/bin/dynamodb
+            rec {
+              dynamodb =
+                prev.stdenv.mkDerivation {
+                  name = "dynamodb";
+                  src = builtins.fetchurl {
+                    url = "https://s3.ap-northeast-1.amazonaws.com/dynamodb-local-tokyo/dynamodb_local_latest.tar.gz";
+                    sha256 = "sha256:0xim1g97m0kklkqk9573aizac3c70r8vjcv14wn8al3cz7b68da3";
+                  };
+                  buildPhase = ''
+                    mkdir -p $out
+                    cd $out
+                    tar -xf $src
                   '';
-                checkPhase = ''
-                  $out/bin/dynamodb -help
-                '';
-              };
-            in
-            {
+                  installPhase =
+                    let jre = prev.jre_minimal.override {
+                      modules = [
+                        "java.base"
+                        "java.logging"
+                        "java.xml"
+                        "java.desktop"
+                      ];
+                    }; in
+                    ''
+                      mkdir -p $out/bin
+                      cat > $out/bin/dynamodb <<EOF
+                        ${jre}/bin/java -Djava.library.path=$out/DynamoDBLocal_lib \
+                          -jar $out/DynamoDBLocal.jar "\$@"
+                      EOF
+                      chmod +x $out/bin/dynamodb
+                    '';
+                  checkPhase = ''
+                    $out/bin/dynamodb -help
+                  '';
+                };
+
               persistent-dynamodb = final.haskell-nix.project' {
                 src = ./.;
                 name = "persistent-dynamodb";
                 compiler-nix-name = "ghc925"; # Version of GHC to use
 
                 shell = {
+                  additional = pkgs:
+                    # pkgs contains some non-package attributes, so we need rigorous checks to filter them out 
+                    builtins.attrValues
+                      (
+                        prev.lib.filterAttrs
+                          (
+                            _: pkg:
+                              pkg != null
+                              && (pkg.isLocal or false)
+                              && !pkg.isProject
+                          )
+                          pkgs
+                      );
                   tools = {
                     cabal = "latest";
                     haskell-language-server = {
@@ -74,7 +82,7 @@
                   buildInputs = with prev; [
                     rnix-lsp
                     nixpkgs-fmt
-                    localDynamoDB
+                    dynamodb
                   ];
                   withHoogle = true;
                 };
@@ -88,11 +96,16 @@
       in
       flake // rec {
         legacyPackages = pkgs;
+        packages.default = flake.packages."persistent-dynamodb:lib:persistent-dynamodb";
+        checks.default = flake.checks."persistent-dynamodb:test:persistent-dynamodb-test".overrideAttrs
+          (finalAttrs: prevAttrs: {
+            buildPhase = ''
+              export PATH=${pkgs.dynamodb}/bin:$PATH
+            '' + prevAttrs.buildPhase;
+          });
       });
 
   nixConfig = {
-    extra-substituters = [ "https://cache.iog.io" ];
-    extra-trusted-public-keys = [ "hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ=" ];
     allow-import-from-derivation = "true";
   };
 }

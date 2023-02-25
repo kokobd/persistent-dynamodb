@@ -2,7 +2,7 @@ packages: ./
 
 source-repository-package
   type: git
-  location: https://github.com/brendanhay/amazonka.git
-  tag: f610f8c95e190edf86606c5f86485d198671beb0
   subdir: lib/amazonka lib/amazonka-core lib/services/amazonka-sts lib/services/amazonka-sso lib/services/amazonka-dynamodb
-  --sha256: sha256-Zmaz/QmOS14mWeEGtDVq6C+AfNBHS5Pl6Cy/aqbnAPM=
+  location: https://github.com/brendanhay/amazonka.git
+  tag: 12e541144ad5452645877e885152a2bad9180186
+  --sha256: sha256-yQwkXawKCpJC6L/5Tkxk02jw0ZCVbPqj+e4qEchfQ4Q=
