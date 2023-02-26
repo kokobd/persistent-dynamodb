@@ -208,10 +208,26 @@ instance PersistStoreWrite Backend where
     record ->
     ReaderT Backend m ()
   insertKey key record =
+    case HashMap.toList keyAttrs of
+      (attrName, _) : _ ->
+        void . sendRequest $
+          Amazonka.newPutItem (tableName @record)
+            & field @"item" .~ encodeRecord record <> keyAttrs
+            & field @"conditionExpression" ?~ "attribute_not_exists(#c)"
+            & field @"expressionAttributeNames" ?~ HashMap.fromList [("#c", attrName)]
+      _ -> liftIO . throwIO $ BadEntityImpl "encoded key is empty, check your keyToValues implementation"
+    where
+      keyAttrs = encodeKey key
+  repsert ::
+    forall m record.
+    (MonadIO m, PersistRecordBackend record Backend) =>
+    Key record ->
+    record ->
+    ReaderT Backend m ()
+  repsert key record =
     void . sendRequest $
       Amazonka.newPutItem (tableName @record)
         & field @"item" .~ encodeRecord record <> encodeKey key
-  repsert = undefined
   replace = undefined
   delete = undefined
   update = undefined
