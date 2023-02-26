@@ -34,9 +34,11 @@ import Data.Aeson (FromJSON, ToJSON)
 import Data.Bifunctor (second)
 import qualified Data.Binary as Binary
 import qualified Data.ByteString.Lazy as LBS
+import Data.Functor (($>))
 import Data.Generics.Product (field)
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
+import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map as Map
 import Data.Proxy (Proxy (Proxy))
 import Data.Text (Text)
@@ -44,6 +46,7 @@ import qualified Data.Text as T
 import Data.Traversable (forM)
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
+import qualified Data.UUID.V4 as UUID
 import qualified Data.Vector as V
 import Database.Persist
 import Database.Persist.Sql (PersistFieldSql (sqlType))
@@ -67,6 +70,9 @@ instance PersistCore Backend where
 
 defaultMkPersistSettings :: MkPersistSettings
 defaultMkPersistSettings = mkPersistSettings (ConT ''Backend)
+
+nextRandomBackendKey :: (MonadIO m) => m (BackendKey Backend)
+nextRandomBackendKey = BackendKeyUUID <$> liftIO UUID.nextRandom
 
 instance PersistField (BackendKey Backend) where
   toPersistValue :: BackendKey Backend -> PersistValue
@@ -92,6 +98,7 @@ instance HasPersistBackend Backend where
 data Error
   = EncodeFailure Text
   | DecodeFailure Text
+  | BadEntityImpl Text
   deriving stock (Show, Eq, Generic)
   deriving anyclass (Exception)
 
@@ -127,22 +134,44 @@ decodeValue (Amazonka.SS strings) = decodeValue . Amazonka.L $ Amazonka.S <$> st
 decodeValue (Amazonka.S str) = Right $ PersistText str
 decodeValue (Amazonka.BOOL bool) = Right $ PersistBool bool
 
-getFieldNames :: forall record. (PersistEntity record) => [Text]
-getFieldNames = unFieldNameDB . fieldDB <$> getEntityFields entityDef'
+encodeFields :: [(FieldDef, PersistValue)] -> HashMap Text Amazonka.AttributeValue
+encodeFields = HashMap.fromList . fmap (bimap (unFieldNameDB . fieldDB) encodeValue)
+
+decodeFields :: [FieldDef] -> HashMap Text Amazonka.AttributeValue -> Either Text [PersistValue]
+decodeFields defs attributes = forM fieldNames $ \name ->
+  maybe (Left $ "field " <> name <> " doesn't exist in the table") decodeValue $
+    attributes HashMap.!? name
+  where
+    fieldNames = fmap (unFieldNameDB . fieldDB) defs
+
+getRecordFields :: forall record. (PersistEntity record) => [FieldDef]
+getRecordFields = getEntityFields entityDef'
   where
     entityDef' = entityDef (Proxy :: Proxy record)
 
 decodeRecord :: forall record. (PersistEntity record) => HashMap Text Amazonka.AttributeValue -> Either Text record
-decodeRecord attributes = do
-  fields :: [PersistValue] <- forM (getFieldNames @record) $ \name ->
-    maybe (Left $ "field " <> name <> " doesn't exist in the table") decodeValue $
-      attributes HashMap.!? name
-  fromPersistValues fields
+decodeRecord attributes = decodeFields (getRecordFields @record) attributes >>= fromPersistValues
 
 encodeRecord :: forall record. (PersistEntity record) => record -> HashMap Text Amazonka.AttributeValue
-encodeRecord record = HashMap.fromList . zip (getFieldNames @record) . fmap encodeValue $ fields
+encodeRecord record = encodeFields (zip (getRecordFields @record) (toPersistFields record))
+
+encodeKey :: forall record. (PersistEntity record) => Key record -> HashMap Text Amazonka.AttributeValue
+encodeKey key =
+  let fieldDefs = case entityIdDef of
+        EntityIdField idFieldDef -> [idFieldDef]
+        EntityIdNaturalKey (CompositeDef fieldDefs' _) -> NonEmpty.toList fieldDefs'
+   in encodeFields $ zip fieldDefs (keyToValues key)
   where
-    fields = toPersistFields record
+    entityDef' = entityDef (Proxy :: Proxy record)
+    entityIdDef = getEntityId entityDef'
+
+tableName :: forall record. (PersistEntity record) => Text
+tableName = escapeWith id $ getEntityDBName (entityDef (Proxy @record))
+
+sendRequest :: forall m req. (MonadIO m, Amazonka.AWSRequest req) => req -> ReaderT Backend m (Amazonka.AWSResponse req)
+sendRequest req = do
+  env <- asks $ view (field @"env")
+  liftIO . Amazonka.runResourceT $ Amazonka.send env req
 
 instance PersistStoreRead Backend where
   get ::
@@ -151,46 +180,37 @@ instance PersistStoreRead Backend where
     Key record ->
     ReaderT Backend m (Maybe record)
   get key = do
-    let entityDef' = entityDef (Proxy :: Proxy record)
-        entityIdDef = getEntityId entityDef'
-        tableName = escapeWith id $ getEntityDBName entityDef'
-    case entityIdDef of
-      EntityIdField idFieldDef -> do
-        let idFieldName = unFieldNameDB $ fieldDB idFieldDef
-            [keyPValue] = keyToValues key
-            req = Amazonka.newGetItem tableName & field @"key" . at idFieldName ?~ encodeValue keyPValue
-        env <- asks $ view (field @"env")
-        resp <- liftIO $ Amazonka.runResourceT $ Amazonka.send env req
-        case resp ^. field @"item" of
-          Nothing -> pure Nothing
-          Just item -> case decodeRecord item of
-            Left errMsg -> liftIO . throwIO . DecodeFailure $ errMsg
-            Right record -> pure $ Just record
-      EntityIdNaturalKey (CompositeDef fields attrs) ->
-        -- TODO
-        pure Nothing
+    resp <- sendRequest $ Amazonka.newGetItem (tableName @record) & field @"key" .~ encodeKey key
+    case resp ^. field @"item" of
+      Nothing -> pure Nothing
+      Just item -> case decodeRecord item of
+        Left errMsg -> liftIO . throwIO . DecodeFailure $ errMsg
+        Right record -> pure $ Just record
 
 instance PersistStoreWrite Backend where
-  insert record = undefined
+  insert ::
+    forall m record.
+    (MonadIO m, PersistRecordBackend record Backend, SafeToInsert record) =>
+    record ->
+    ReaderT Backend m (Key record)
+  insert record = case keyFromRecordM of
+    Nothing -> do
+      backendKey <- nextRandomBackendKey
+      either (liftIO . throwIO . BadEntityImpl) pure $
+        keyFromValues @record [toPersistValue backendKey]
+    Just getKey ->
+      let key = getKey record
+       in insertKey key record $> key
   insertKey ::
     forall m record.
     (MonadIO m, PersistRecordBackend record Backend) =>
     Key record ->
     record ->
     ReaderT Backend m ()
-  insertKey key record = do
-    let entityDef' = entityDef (Proxy :: Proxy record)
-        entityIdDef = getEntityId entityDef'
-        tableName = escapeWith id $ getEntityDBName entityDef'
-    case entityIdDef of
-      EntityIdField idFieldDef -> do
-        let idFieldName = unFieldNameDB $ fieldDB idFieldDef
-            [keyPValue] = keyToValues key
-            attributeMap = encodeRecord record <> HashMap.singleton idFieldName (encodeValue keyPValue)
-            req = Amazonka.newPutItem tableName & field @"item" .~ attributeMap
-        env <- asks $ view (field @"env")
-        void . liftIO . Amazonka.runResourceT $ Amazonka.send env req
-      EntityIdNaturalKey (CompositeDef fields attrs) -> pure () -- TODO
+  insertKey key record =
+    void . sendRequest $
+      Amazonka.newPutItem (tableName @record)
+        & field @"item" .~ encodeRecord record <> encodeKey key
   repsert = undefined
   replace = undefined
   delete = undefined

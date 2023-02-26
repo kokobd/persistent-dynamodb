@@ -48,6 +48,12 @@ User
   email Text
   age Int
   deriving Show Eq
+User2
+  name Text
+  email Text
+  age Int
+  Primary name email
+  deriving Show Eq
 |]
 
 keyGen :: (MonadGen m, MonadIO m) => m (BackendKey DynamoDB.Backend)
@@ -62,6 +68,11 @@ userGen = do
   userAge <- Gen.int (Range.linear 10 50)
   pure User {..}
 
+user2Gen :: (MonadGen m) => m User2
+user2Gen = do
+  User {..} <- userGen
+  pure User2 {user2Name = userName, user2Email = userEmail, user2Age = userAge}
+
 migrateTables :: (MonadIO m) => Amazonka.Env -> m ()
 migrateTables env = liftIO . Amazonka.runResourceT $ do
   void . Amazonka.send env $
@@ -69,6 +80,18 @@ migrateTables env = liftIO . Amazonka.runResourceT $ do
       "user"
       (Amazonka.newKeySchemaElement "id" Amazonka.KeyType_HASH :| [])
       & field @"attributeDefinitions" .~ [Amazonka.newAttributeDefinition "id" Amazonka.ScalarAttributeType_B]
+      & field @"billingMode" ?~ Amazonka.BillingMode_PAY_PER_REQUEST
+  void . Amazonka.send env $
+    Amazonka.newCreateTable
+      "user2"
+      ( Amazonka.newKeySchemaElement "name" Amazonka.KeyType_HASH
+          :| [ Amazonka.newKeySchemaElement "email" Amazonka.KeyType_RANGE
+             ]
+      )
+      & field @"attributeDefinitions"
+        .~ [ Amazonka.newAttributeDefinition "name" Amazonka.ScalarAttributeType_S,
+             Amazonka.newAttributeDefinition "email" Amazonka.ScalarAttributeType_S
+           ]
       & field @"billingMode" ?~ Amazonka.BillingMode_PAY_PER_REQUEST
   pure ()
 
@@ -88,14 +111,22 @@ test_integration =
   withResource initBackend (const (pure ())) $ \getBackend ->
     testGroup
       "integration tests"
-      [ testProperty "insertAndGet" $
+      [ testProperty "insert and get" $
           property $ do
             (UserKey -> key, user) <- forAllT $ (,) <$> keyGen <*> userGen
             user' <- runDBActions getBackend $ do
               insertKey key user
-              get @DynamoDB.Backend @User key
+              get key
             Just user === user'
-            pure ()
+            pure (),
+        testProperty "insert and get with custom primary key" $
+          property $ do
+            user2 <- forAllT user2Gen
+            let key = User2Key (user2Name user2) (user2Email user2)
+            user' <- runDBActions getBackend $ do
+              insertKey key user2
+              get key
+            Just user2 === user'
       ]
   where
     runDBActions :: (MonadIO m) => IO DynamoDB.Backend -> ReaderT DynamoDB.Backend m a -> m a
