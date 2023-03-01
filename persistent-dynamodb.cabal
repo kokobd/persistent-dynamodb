@@ -57,6 +57,8 @@ test-suite tests
   build-depends:
     , hedgehog
     , persistent-dynamodb
+    , port-utils
+    , process
     , tasty
     , tasty-hedgehog
     , tasty-hunit

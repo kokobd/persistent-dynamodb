@@ -98,7 +98,7 @@
       flake // rec {
         legacyPackages = pkgs;
         packages.default = flake.packages."persistent-dynamodb:lib:persistent-dynamodb";
-        checks.default = flake.checks."persistent-dynamodb:test:persistent-dynamodb-test".overrideAttrs
+        checks.default = flake.checks."persistent-dynamodb:test:tests".overrideAttrs
           (finalAttrs: prevAttrs: {
             buildPhase = ''
               export PATH=${pkgs.dynamodb}/bin:$PATH

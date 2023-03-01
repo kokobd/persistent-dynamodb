@@ -7,9 +7,11 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedLabels #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
@@ -20,23 +22,31 @@
 module Spec.Database.Persist.DynamoDB where
 
 import qualified Amazonka
+import qualified Amazonka.Auth as Amazonka
 import qualified Amazonka.DynamoDB as Amazonka
 import Control.Lens
 import Control.Monad (void)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Reader (ReaderT, runReaderT)
+import Data.Generics.Labels ()
 import Data.Generics.Product (field)
 import Data.List.NonEmpty (NonEmpty ((:|)))
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.UUID.V4 as UUID
 import Database.Persist
 import qualified Database.Persist.DynamoDB as DynamoDB
 import Database.Persist.TH
+import GHC.Generics (Generic)
 import Hedgehog (MonadGen, property, (===))
 import qualified Hedgehog.Gen as Gen
 import Hedgehog.Internal.Property (forAllT)
 import qualified Hedgehog.Range as Range
+import qualified Network.Socket.Wait
+import System.Environment (lookupEnv)
+import System.IO (Handle, IOMode (WriteMode), openFile)
 import qualified System.IO as IO
+import qualified System.Process as Process
 import Test.Tasty (TestTree, testGroup, withResource)
 import Test.Tasty.Hedgehog (testProperty)
 
@@ -95,26 +105,46 @@ migrateTables env = liftIO . Amazonka.runResourceT $ do
       & field @"billingMode" ?~ Amazonka.BillingMode_PAY_PER_REQUEST
   pure ()
 
-initBackend :: IO DynamoDB.Backend
-initBackend = do
-  logger <- Amazonka.newLogger Amazonka.Info IO.stdout
-  env <- Amazonka.newEnv Amazonka.discover
-  let env' = env {Amazonka.logger, Amazonka.overrides = useLocalDynamoDB}
-  migrateTables env'
-  pure $ DynamoDB.newBackend env'
+data Resources = Resources
+  { backend :: DynamoDB.Backend,
+    ddbProcess :: (Maybe Handle, Maybe Handle, Maybe Handle, Process.ProcessHandle)
+  }
+  deriving (Generic)
 
-useLocalDynamoDB :: Amazonka.Service -> Amazonka.Service
-useLocalDynamoDB = Amazonka.setEndpoint False "localhost" 8000 -- TODO start a local process
+initResources :: IO Resources
+initResources = do
+  nullFile <- openFile "/dev/null" WriteMode
+  dynamoDBPort <- read @Int . fromMaybe "8000" <$> lookupEnv "DYNAMODB_PORT"
+  ddbProcess <-
+    Process.createProcess
+      (Process.shell $ "dynamodb -inMemory -port " <> show dynamoDBPort)
+        { Process.std_out = Process.UseHandle nullFile,
+          Process.create_group = True,
+          Process.close_fds = True
+        }
+  Network.Socket.Wait.wait "localhost" dynamoDBPort
+  logger <- Amazonka.newLogger Amazonka.Info IO.stdout
+  env <- Amazonka.newEnv $ pure . Amazonka.fromKeys "fakeKeyId" "fakeSecretAccessKey"
+  let env' = env {Amazonka.logger, Amazonka.overrides = Amazonka.setEndpoint False "localhost" dynamoDBPort}
+  migrateTables env'
+  pure Resources {backend = DynamoDB.newBackend env', ddbProcess}
+
+freeResources :: Resources -> IO ()
+freeResources Resources {ddbProcess} = do
+  let handle = view _4 ddbProcess
+  Process.interruptProcessGroupOf handle
+  void $ Process.waitForProcess handle
+  Process.cleanupProcess ddbProcess
 
 test_integration :: TestTree
 test_integration =
-  withResource initBackend (const (pure ())) $ \getBackend ->
+  withResource initResources freeResources $ \getResources ->
     testGroup
       "integration tests"
-      [ testProperty "insert and get" $
+      [ testProperty "insert and get with default primary key" $
           property $ do
             (UserKey -> key, user) <- forAllT $ (,) <$> keyGen <*> userGen
-            user' <- runDBActions getBackend $ do
+            user' <- runDBActions getResources $ do
               insertKey key user
               get key
             Just user === user'
@@ -123,11 +153,11 @@ test_integration =
           property $ do
             user2 <- forAllT user2Gen
             let key = User2Key (user2Name user2) (user2Email user2)
-            user' <- runDBActions getBackend $ do
+            user' <- runDBActions getResources $ do
               insertKey key user2
               get key
             Just user2 === user'
       ]
   where
-    runDBActions :: (MonadIO m) => IO DynamoDB.Backend -> ReaderT DynamoDB.Backend m a -> m a
-    runDBActions getBackend actions = liftIO getBackend >>= runReaderT actions
+    runDBActions :: (MonadIO m) => IO Resources -> ReaderT DynamoDB.Backend m a -> m a
+    runDBActions getResources actions = liftIO (view #backend <$> getResources) >>= runReaderT actions

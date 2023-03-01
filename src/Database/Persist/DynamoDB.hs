@@ -40,6 +40,8 @@ import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map as Map
+import Data.Map.Strict (Map)
+import Data.Maybe (catMaybes)
 import Data.Proxy (Proxy (Proxy))
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -201,6 +203,7 @@ instance PersistStoreWrite Backend where
     Just getKey ->
       let key = getKey record
        in insertKey key record $> key
+
   insertKey ::
     forall m record.
     (MonadIO m, PersistRecordBackend record Backend) =>
@@ -218,6 +221,7 @@ instance PersistStoreWrite Backend where
       _ -> liftIO . throwIO $ BadEntityImpl "encoded key is empty, check your keyToValues implementation"
     where
       keyAttrs = encodeKey key
+
   repsert ::
     forall m record.
     (MonadIO m, PersistRecordBackend record Backend) =>
@@ -228,6 +232,78 @@ instance PersistStoreWrite Backend where
     void . sendRequest $
       Amazonka.newPutItem (tableName @record)
         & field @"item" .~ encodeRecord record <> encodeKey key
-  replace = undefined
-  delete = undefined
-  update = undefined
+
+  replace ::
+    forall m record.
+    (MonadIO m, PersistRecordBackend record Backend) =>
+    Key record ->
+    record ->
+    ReaderT Backend m ()
+  replace key record =
+    case HashMap.toList keyAttrs of
+      (attrName, _) : _ ->
+        void . sendRequest $
+          Amazonka.newPutItem (tableName @record)
+            & field @"item" .~ encodeRecord record <> keyAttrs
+            & field @"conditionExpression" ?~ "attribute_exists(#c)"
+            & field @"expressionAttributeNames" ?~ HashMap.fromList [("#c", attrName)]
+      _ -> liftIO . throwIO $ BadEntityImpl "encoded key is empty, check your keyToValues implementation"
+    where
+      keyAttrs = encodeKey key
+
+  delete ::
+    forall m record.
+    (MonadIO m, PersistRecordBackend record Backend) =>
+    Key record ->
+    ReaderT Backend m ()
+  delete key =
+    void . sendRequest $
+      Amazonka.newDeleteItem (tableName @record)
+        & field @"key" .~ encodeKey key
+  update ::
+    forall m record.
+    (MonadIO m, PersistRecordBackend record Backend) =>
+    Key record ->
+    [Update record] ->
+    ReaderT Backend m ()
+  update _ [] = pure ()
+  update key updates =
+    void . sendRequest $
+      Amazonka.newUpdateItem (tableName @record)
+        & field @"key" .~ encodeKey key
+        & field @"updateExpression" ?~ updateExpression
+        & field @"expressionAttributeNames" ?~ expressionAttributeNames
+        & field @"expressionAttributeValues" ?~ expressionAttributeValues
+    where
+      (updateExpression, expressionAttributeNames, expressionAttributeValues) = renderUpdateExpression updates
+
+renderUpdateExpression ::
+  forall record.
+  (PersistEntity record) =>
+  [Update record] ->
+  (Text, HashMap Text Text, HashMap Text Amazonka.AttributeValue)
+renderUpdateExpression updates =
+  ( "SET " <> T.intercalate ", " (fmap (view _1) rendered),
+    HashMap.fromList . Map.toList . Map.unions $ fmap (view _2) rendered,
+    HashMap.fromList . Map.toList . Map.unions $ fmap (view _3) rendered
+  )
+  where
+    rendered = catMaybes $ zipWith renderOne [1 ..] updates
+
+    renderOne :: Integer -> Update record -> Maybe (Text, Map Text Text, Map Text Amazonka.AttributeValue)
+    renderOne _ (BackendUpdate _) = Nothing
+    renderOne idx (Update field' value action) =
+      let fieldName = unFieldNameDB . fieldDB . persistFieldDef $ field'
+          abstractFieldName = "c" <> T.pack (show idx)
+          abstractValueName = "v" <> T.pack (show idx)
+          expressionAttributeNames = Map.singleton abstractFieldName fieldName
+          expressionAttributeValues = Map.singleton abstractValueName $ encodeValue (toPersistValue value)
+       in do
+            expression <- case action of
+              Assign -> Just $ abstractFieldName <> " = " <> abstractValueName
+              Add -> Just $ abstractFieldName <> " = " <> abstractFieldName <> " + " <> abstractValueName
+              Subtract -> Just $ abstractFieldName <> " = " <> abstractFieldName <> " - " <> abstractValueName
+              Multiply -> Nothing
+              Divide -> Nothing
+              BackendSpecificUpdate _ -> Nothing
+            Just (expression, expressionAttributeNames, expressionAttributeValues)
