@@ -38,7 +38,10 @@ library
   import:          opts
 
   -- cabal-fmt: expand src/
-  exposed-modules: Database.Persist.DynamoDB
+  exposed-modules:
+    Database.Persist.DynamoDB
+    Database.Persist.DynamoDB.KnownErrors
+
   build-depends:
     , base
     , persistent

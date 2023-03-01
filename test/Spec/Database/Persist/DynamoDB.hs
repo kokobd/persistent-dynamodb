@@ -19,11 +19,15 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ViewPatterns #-}
 
-module Spec.Database.Persist.DynamoDB where
+module Spec.Database.Persist.DynamoDB
+  ( test_integration,
+  )
+where
 
 import qualified Amazonka
 import qualified Amazonka.Auth as Amazonka
 import qualified Amazonka.DynamoDB as Amazonka
+import Control.Exception (try)
 import Control.Lens
 import Control.Monad (void)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -38,7 +42,7 @@ import Database.Persist
 import qualified Database.Persist.DynamoDB as DynamoDB
 import Database.Persist.TH
 import GHC.Generics (Generic)
-import Hedgehog (MonadGen, property, (===))
+import Hedgehog (MonadGen, failure, property, success, (===))
 import qualified Hedgehog.Gen as Gen
 import Hedgehog.Internal.Property (forAllT)
 import qualified Hedgehog.Range as Range
@@ -83,8 +87,8 @@ user2Gen = do
   User {..} <- userGen
   pure User2 {user2Name = userName, user2Email = userEmail, user2Age = userAge}
 
-migrateTables :: (MonadIO m) => Amazonka.Env -> m ()
-migrateTables env = liftIO . Amazonka.runResourceT $ do
+createTables :: (MonadIO m) => Amazonka.Env -> m ()
+createTables env = liftIO . Amazonka.runResourceT $ do
   void . Amazonka.send env $
     Amazonka.newCreateTable
       "user"
@@ -126,7 +130,7 @@ initResources = do
   logger <- Amazonka.newLogger Amazonka.Info IO.stdout
   env <- Amazonka.newEnv $ pure . Amazonka.fromKeys "fakeKeyId" "fakeSecretAccessKey"
   let env' = env {Amazonka.logger, Amazonka.overrides = Amazonka.setEndpoint False "localhost" dynamoDBPort}
-  migrateTables env'
+  createTables env'
   pure Resources {backend = DynamoDB.newBackend env', ddbProcess}
 
 freeResources :: Resources -> IO ()
@@ -141,7 +145,7 @@ test_integration =
   withResource initResources freeResources $ \getResources ->
     testGroup
       "integration tests"
-      [ testProperty "insert and get with default primary key" $
+      [ testProperty "insertKey and get with default primary key" $
           property $ do
             (UserKey -> key, user) <- forAllT $ (,) <$> keyGen <*> userGen
             user' <- runDBActions getResources $ do
@@ -149,14 +153,53 @@ test_integration =
               get key
             Just user === user'
             pure (),
-        testProperty "insert and get with custom primary key" $
+        testProperty "insertKey and get with custom primary key" $
           property $ do
-            user2 <- forAllT user2Gen
-            let key = User2Key (user2Name user2) (user2Email user2)
+            user <- forAllT user2Gen
+            let key = User2Key (user2Name user) (user2Email user)
             user' <- runDBActions getResources $ do
-              insertKey key user2
+              insertKey key user
               get key
-            Just user2 === user'
+            Just user === user',
+        testProperty "insertKey twice on the same key result in error" $
+          property $ do
+            (UserKey -> key, user) <- forAllT $ (,) <$> keyGen <*> userGen
+            eitherResult :: Either DynamoDB.Error () <-
+              liftIO . try . runDBActions getResources $ do
+                insertKey key user
+                insertKey key user
+            case eitherResult of
+              Left DynamoDB.DuplicateKey -> success
+              _ -> failure,
+        testProperty "insert generates a key automatically" $
+          property $ do
+            user <- forAllT userGen
+            user' <- runDBActions getResources $ do
+              key <- insert user
+              get key
+            Just user === user',
+        testProperty "insert extract key from record if possible" $
+          property $ do
+            user <- forAllT user2Gen
+            user' <- runDBActions getResources $ insert user >>= get
+            Just user === user',
+        testProperty "repsert: creates or replaces record" $
+          property $ do
+            (UserKey -> key, user) <- forAllT $ (,) <$> keyGen <*> userGen
+            (user', user'') <-
+              runDBActions getResources $
+                (,)
+                  <$> (repsert key user >> get key)
+                  <*> (repsert key user {userName = "okok"} >> get key)
+            Just user === user'
+            Just user {userName = "okok"} === user'',
+        testProperty "replace: updates existing record, but doesn't create new one" $
+          property $ do
+            (UserKey -> key, user) <- forAllT $ (,) <$> keyGen <*> userGen
+            user' <- runDBActions getResources $ do
+              replace key user
+              insertKey key user >> get key
+            Just user === user'
       ]
   where
     runDBActions :: (MonadIO m) => IO Resources -> ReaderT DynamoDB.Backend m a -> m a

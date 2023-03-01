@@ -6,7 +6,10 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE InstanceSigs #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskellQuotes #-}
 {-# LANGUAGE TypeApplications #-}
@@ -51,6 +54,7 @@ import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUID
 import qualified Data.Vector as V
 import Database.Persist
+import Database.Persist.DynamoDB.KnownErrors (isConditionalCheckFailed)
 import Database.Persist.Sql (PersistFieldSql (sqlType))
 import Database.Persist.TH (MkPersistSettings, mkPersistSettings)
 import GHC.Generics (Generic)
@@ -101,8 +105,13 @@ data Error
   = EncodeFailure Text
   | DecodeFailure Text
   | BadEntityImpl Text
-  deriving stock (Show, Eq, Generic)
+  | DuplicateKey
+  | InternalError Amazonka.Error
+  deriving stock (Show, Generic)
   deriving anyclass (Exception)
+
+throwError :: (MonadIO m) => Error -> m a
+throwError = liftIO . throwIO
 
 encodeValue :: PersistValue -> Amazonka.AttributeValue
 encodeValue (PersistText v) = Amazonka.S v
@@ -175,6 +184,22 @@ sendRequest req = do
   env <- asks $ view (field @"env")
   liftIO . Amazonka.runResourceT $ Amazonka.send env req
 
+sendRequestEither ::
+  forall m req.
+  (MonadIO m, Amazonka.AWSRequest req) =>
+  req ->
+  ReaderT Backend m (Either Amazonka.Error (Amazonka.AWSResponse req))
+sendRequestEither req = do
+  env <- asks $ view (field @"env")
+  liftIO . Amazonka.runResourceT $ Amazonka.sendEither env req
+
+handleAwsError :: (MonadIO m) => Either Amazonka.Error a -> (Amazonka.Error -> Maybe (m b)) -> (a -> m b) -> m b
+handleAwsError (Right a) _ f = f a
+handleAwsError (Left err) handleError _ = do
+  case handleError err of
+    Nothing -> throwError $ InternalError err
+    Just m -> m
+
 instance PersistStoreRead Backend where
   get ::
     forall m record.
@@ -195,14 +220,15 @@ instance PersistStoreWrite Backend where
     (MonadIO m, PersistRecordBackend record Backend, SafeToInsert record) =>
     record ->
     ReaderT Backend m (Key record)
-  insert record = case keyFromRecordM of
-    Nothing -> do
-      backendKey <- nextRandomBackendKey
-      either (liftIO . throwIO . BadEntityImpl) pure $
-        keyFromValues @record [toPersistValue backendKey]
-    Just getKey ->
-      let key = getKey record
-       in insertKey key record $> key
+  insert record = do
+    key <- case keyFromRecordM of
+      Nothing -> do
+        backendKey <- nextRandomBackendKey
+        either (liftIO . throwIO . BadEntityImpl) pure $
+          keyFromValues @record [toPersistValue backendKey]
+      Just getKey ->
+        pure $ getKey record
+    insertKey key record $> key
 
   insertKey ::
     forall m record.
@@ -212,13 +238,22 @@ instance PersistStoreWrite Backend where
     ReaderT Backend m ()
   insertKey key record =
     case HashMap.toList keyAttrs of
-      (attrName, _) : _ ->
-        void . sendRequest $
-          Amazonka.newPutItem (tableName @record)
-            & field @"item" .~ encodeRecord record <> keyAttrs
-            & field @"conditionExpression" ?~ "attribute_not_exists(#c)"
-            & field @"expressionAttributeNames" ?~ HashMap.fromList [("#c", attrName)]
-      _ -> liftIO . throwIO $ BadEntityImpl "encoded key is empty, check your keyToValues implementation"
+      (attrName, _) : _ -> do
+        eitherResp <-
+          sendRequestEither $
+            Amazonka.newPutItem (tableName @record)
+              & field @"item" .~ encodeRecord record <> keyAttrs
+              & field @"conditionExpression" ?~ "attribute_not_exists(#c)"
+              & field @"expressionAttributeNames" ?~ HashMap.fromList [("#c", attrName)]
+        handleAwsError
+          eitherResp
+          ( \err ->
+              if isConditionalCheckFailed err
+                then Just (throwError DuplicateKey)
+                else Nothing
+          )
+          (const (pure ()))
+      _ -> throwError $ BadEntityImpl "encoded key is empty, check your keyToValues implementation"
     where
       keyAttrs = encodeKey key
 
@@ -241,12 +276,21 @@ instance PersistStoreWrite Backend where
     ReaderT Backend m ()
   replace key record =
     case HashMap.toList keyAttrs of
-      (attrName, _) : _ ->
-        void . sendRequest $
-          Amazonka.newPutItem (tableName @record)
-            & field @"item" .~ encodeRecord record <> keyAttrs
-            & field @"conditionExpression" ?~ "attribute_exists(#c)"
-            & field @"expressionAttributeNames" ?~ HashMap.fromList [("#c", attrName)]
+      (attrName, _) : _ -> do
+        eitherResp <-
+          sendRequestEither $
+            Amazonka.newPutItem (tableName @record)
+              & field @"item" .~ encodeRecord record <> keyAttrs
+              & field @"conditionExpression" ?~ "attribute_exists(#c)"
+              & field @"expressionAttributeNames" ?~ HashMap.fromList [("#c", attrName)]
+        handleAwsError
+          eitherResp
+          ( \err ->
+              if isConditionalCheckFailed err
+                then Just (pure ())
+                else Nothing
+          )
+          (const (pure ()))
       _ -> liftIO . throwIO $ BadEntityImpl "encoded key is empty, check your keyToValues implementation"
     where
       keyAttrs = encodeKey key
