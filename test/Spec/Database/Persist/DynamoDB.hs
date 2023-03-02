@@ -52,6 +52,7 @@ import System.IO (Handle, IOMode (WriteMode), openFile)
 import qualified System.IO as IO
 import qualified System.Process as Process
 import Test.Tasty (TestTree, testGroup, withResource)
+import Test.Tasty.HUnit (testCase, (@=?))
 import Test.Tasty.Hedgehog (testProperty)
 
 share
@@ -81,6 +82,14 @@ userGen = do
   userEmail <- Gen.text (Range.linear 1 10) Gen.latin1
   userAge <- Gen.int (Range.linear 10 50)
   pure User {..}
+
+exampleUser :: User
+exampleUser =
+  User
+    { userName = "assam",
+      userEmail = "assam@gmail.com",
+      userAge = 3
+    }
 
 user2Gen :: (MonadGen m) => m User2
 user2Gen = do
@@ -199,7 +208,35 @@ test_integration =
             user' <- runDBActions getResources $ do
               replace key user
               insertKey key user >> get key
-            Just user === user'
+            Just user === user',
+        testProperty "get after delete returns Nothing" $
+          property $ do
+            user <- forAllT userGen
+            user' <- runDBActions getResources $ do
+              key <- insert user
+              delete key
+              get key
+            Nothing === user',
+        testProperty "update no field is no-op" $
+          property $ do
+            user <- forAllT userGen
+            user' <- runDBActions getResources $ do
+              key <- insert user
+              update key []
+              get key
+            Just user === user',
+        testCase "update some fields" $ do
+          user' <- runDBActions getResources $ do
+            key <- insert exampleUser
+            update key [UserName =. "dodo", UserEmail =. "dodo@gmail.com"]
+            get key
+          Just (exampleUser {userName = "dodo", userEmail = "dodo@gmail.com"}) @=? user',
+        testCase "increment integral field" $ do
+          user' <- runDBActions getResources $ do
+            key <- insert exampleUser
+            update key [UserAge +=. 1]
+            get key
+          Just (exampleUser {userAge = 4}) @=? user'
       ]
   where
     runDBActions :: (MonadIO m) => IO Resources -> ReaderT DynamoDB.Backend m a -> m a

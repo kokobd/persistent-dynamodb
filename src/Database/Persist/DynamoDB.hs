@@ -23,6 +23,9 @@ module Database.Persist.DynamoDB
     defaultMkPersistSettings,
     newBackend,
     Error (..),
+
+    -- * Internal
+    renderUpdateExpression,
   )
 where
 
@@ -338,8 +341,8 @@ renderUpdateExpression updates =
     renderOne _ (BackendUpdate _) = Nothing
     renderOne idx (Update field' value action) =
       let fieldName = unFieldNameDB . fieldDB . persistFieldDef $ field'
-          abstractFieldName = "c" <> T.pack (show idx)
-          abstractValueName = "v" <> T.pack (show idx)
+          abstractFieldName = "#c" <> T.pack (show idx)
+          abstractValueName = ":v" <> T.pack (show idx)
           expressionAttributeNames = Map.singleton abstractFieldName fieldName
           expressionAttributeValues = Map.singleton abstractValueName $ encodeValue (toPersistValue value)
        in do
