@@ -19,6 +19,7 @@ common opts
     , base
     , binary
     , bytestring
+    , conduit
     , containers
     , generic-lens
     , http-api-data
@@ -26,6 +27,7 @@ common opts
     , mtl
     , path-pieces
     , persistent
+    , resourcet
     , template-haskell
     , text
     , time

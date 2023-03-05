@@ -3,6 +3,7 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE InstanceSigs #-}
@@ -10,6 +11,7 @@
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskellQuotes #-}
 {-# LANGUAGE TypeApplications #-}
@@ -18,14 +20,21 @@
 {-# LANGUAGE NoFieldSelectors #-}
 
 module Database.Persist.DynamoDB
-  ( Backend,
+  ( -- * Backend
+    Backend,
     BackendKey (BackendKeyUUID),
-    defaultMkPersistSettings,
     newBackend,
+    defaultMkPersistSettings,
+
+    -- * Error
     Error (..),
 
-    -- * Internal
-    renderUpdateExpression,
+    -- * Making raw requests
+    tableName,
+    sendRequestEither,
+    encodeKey,
+    encodeRecord,
+    decodeRecord,
   )
 where
 
@@ -36,10 +45,14 @@ import Control.Lens
 import Control.Monad (void)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Reader (ReaderT, asks)
+import Data.Acquire (Acquire)
 import Data.Aeson (FromJSON, ToJSON)
-import Data.Bifunctor (second)
+import Data.Bifunctor (first, second)
 import qualified Data.Binary as Binary
 import qualified Data.ByteString.Lazy as LBS
+import Data.Conduit (ConduitT)
+import Data.Foldable (find)
+import Data.Function (on)
 import Data.Functor (($>))
 import Data.Generics.Product (field)
 import Data.HashMap.Strict (HashMap)
@@ -47,8 +60,9 @@ import qualified Data.HashMap.Strict as HashMap
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map as Map
 import Data.Map.Strict (Map)
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, maybeToList)
 import Data.Proxy (Proxy (Proxy))
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Traversable (forM)
@@ -77,6 +91,7 @@ instance PersistCore Backend where
   newtype BackendKey Backend = BackendKeyUUID UUID
     deriving newtype (Show, Read, Eq, Ord, ToJSON, FromJSON, FromHttpApiData, ToHttpApiData)
 
+-- | Use 'Backend' as the backend
 defaultMkPersistSettings :: MkPersistSettings
 defaultMkPersistSettings = mkPersistSettings (ConT ''Backend)
 
@@ -115,6 +130,10 @@ data Error
 
 throwError :: (MonadIO m) => Error -> m a
 throwError = liftIO . throwIO
+
+throwEither :: (MonadIO m) => Either Error a -> m a
+throwEither (Left err) = throwError err
+throwEither (Right x) = pure x
 
 encodeValue :: PersistValue -> Amazonka.AttributeValue
 encodeValue (PersistText v) = Amazonka.S v
@@ -163,21 +182,29 @@ getRecordFields = getEntityFields entityDef'
   where
     entityDef' = entityDef (Proxy :: Proxy record)
 
-decodeRecord :: forall record. (PersistEntity record) => HashMap Text Amazonka.AttributeValue -> Either Text record
-decodeRecord attributes = decodeFields (getRecordFields @record) attributes >>= fromPersistValues
-
 encodeRecord :: forall record. (PersistEntity record) => record -> HashMap Text Amazonka.AttributeValue
 encodeRecord record = encodeFields (zip (getRecordFields @record) (toPersistFields record))
 
+decodeRecord :: forall record. (PersistEntity record) => HashMap Text Amazonka.AttributeValue -> Either Error record
+decodeRecord attributes = first DecodeFailure $ decodeFields (getRecordFields @record) attributes >>= fromPersistValues
+
 encodeKey :: forall record. (PersistEntity record) => Key record -> HashMap Text Amazonka.AttributeValue
-encodeKey key =
-  let fieldDefs = case entityIdDef of
-        EntityIdField idFieldDef -> [idFieldDef]
-        EntityIdNaturalKey (CompositeDef fieldDefs' _) -> NonEmpty.toList fieldDefs'
-   in encodeFields $ zip fieldDefs (keyToValues key)
-  where
-    entityDef' = entityDef (Proxy :: Proxy record)
-    entityIdDef = getEntityId entityDef'
+encodeKey key = encodeFields $ zip (entityIdFieldDefs @record) (keyToValues key)
+
+decodeKey :: forall record. (PersistEntity record) => HashMap Text Amazonka.AttributeValue -> Either Error (Key record)
+decodeKey attributes = first DecodeFailure $ decodeFields (entityIdFieldDefs @record) attributes >>= keyFromValues
+
+decodeEntity ::
+  forall record.
+  (PersistEntity record) =>
+  HashMap Text Amazonka.AttributeValue ->
+  Either Error (Entity record)
+decodeEntity attributes = Entity <$> decodeKey attributes <*> decodeRecord attributes
+
+entityIdFieldDefs :: forall record. (PersistEntity record) => [FieldDef]
+entityIdFieldDefs = case getEntityId (entityDef (Proxy @record)) of
+  EntityIdField idFieldDef -> [idFieldDef]
+  EntityIdNaturalKey (CompositeDef fieldDefs' _) -> NonEmpty.toList fieldDefs'
 
 tableName :: forall record. (PersistEntity record) => Text
 tableName = escapeWith id $ getEntityDBName (entityDef (Proxy @record))
@@ -214,7 +241,7 @@ instance PersistStoreRead Backend where
     case resp ^. field @"item" of
       Nothing -> pure Nothing
       Just item -> case decodeRecord item of
-        Left errMsg -> liftIO . throwIO . DecodeFailure $ errMsg
+        Left err -> throwError err
         Right record -> pure $ Just record
 
 instance PersistStoreWrite Backend where
@@ -227,7 +254,7 @@ instance PersistStoreWrite Backend where
     key <- case keyFromRecordM of
       Nothing -> do
         backendKey <- nextRandomBackendKey
-        either (liftIO . throwIO . BadEntityImpl) pure $
+        either (throwError . BadEntityImpl) pure $
           keyFromValues @record [toPersistValue backendKey]
       Just getKey ->
         pure $ getKey record
@@ -350,7 +377,125 @@ renderUpdateExpression updates =
               Assign -> Just $ abstractFieldName <> " = " <> abstractValueName
               Add -> Just $ abstractFieldName <> " = " <> abstractFieldName <> " + " <> abstractValueName
               Subtract -> Just $ abstractFieldName <> " = " <> abstractFieldName <> " - " <> abstractValueName
-              Multiply -> Nothing
+              Multiply -> Nothing -- TODO Add support for multiplication and division
               Divide -> Nothing
               BackendSpecificUpdate _ -> Nothing
             Just (expression, expressionAttributeNames, expressionAttributeValues)
+
+data IndexQueryConditions = IndexQueryConditions
+  { iqcIndexName :: Maybe ConstraintNameDB,
+    iqcPartitionKey :: (Text, Amazonka.AttributeValue),
+    iqcSortKey :: Maybe (Text, Amazonka.AttributeValue)
+  }
+  deriving (Show, Eq, Generic)
+
+setIndexQueryCondition :: IndexQueryConditions -> Amazonka.Query -> Amazonka.Query
+setIndexQueryCondition IndexQueryConditions {..} query =
+  query
+    & field @"indexName" .~ fmap unConstraintNameDB iqcIndexName
+    & field @"keyConditionExpression" ?~ "#pk = :pk, #sk = :sk"
+    & field @"expressionAttributeNames"
+      ?~ HashMap.fromList
+        ( ("#pk", fst iqcPartitionKey)
+            : maybeToList (fmap (\(sk, _) -> ("#sk", sk)) iqcSortKey)
+        )
+    & field @"expressionAttributeValues"
+      ?~ HashMap.fromList
+        ( (":pk", snd iqcPartitionKey)
+            : maybeToList (fmap (\(_, sk) -> (":sk", sk)) iqcSortKey)
+        )
+
+encodeUnique ::
+  forall record.
+  (PersistEntity record) =>
+  Unique record ->
+  Either Error IndexQueryConditions
+encodeUnique unique = do
+  uniqueDef <-
+    maybe
+      (Left $ BadEntityImpl "No UniqueDef for the current unique key is found")
+      Right
+      uniqueDefMaybe
+  let indexName =
+        if NonEmpty.toList (uniqueFields uniqueDef) -- primary key doesn't have index name
+          == fmap
+            (\fieldDef -> (fieldHaskell fieldDef, fieldDB fieldDef))
+            (entityIdFieldDefs @record)
+          then Nothing
+          else Just (uniqueDBName uniqueDef)
+  (partitionKey, sortKey) <- pksk
+  pure IndexQueryConditions {iqcIndexName = indexName, iqcPartitionKey = partitionKey, iqcSortKey = sortKey}
+  where
+    uniqueDefMaybe =
+      find
+        ( \uniqueDef ->
+            on
+              (==)
+              (Set.fromList . NonEmpty.toList)
+              (uniqueFields uniqueDef)
+              (persistUniqueToFieldNames unique)
+        )
+        . getEntityUniques
+        $ entityDef (Proxy @record)
+    pksk =
+      case zipWith
+        (\(_, unFieldNameDB -> fieldName) value -> (fieldName, encodeValue value))
+        (NonEmpty.toList (persistUniqueToFieldNames unique))
+        (persistUniqueToValues unique) of
+        [partitionKey] -> Right (partitionKey, Nothing)
+        [partitionKey, sortKey] -> Right (partitionKey, Just sortKey)
+        _ -> Left $ BadEntityImpl "DynamoDB only supports unique index consists of 1 or 2 fields"
+
+instance PersistUniqueRead Backend where
+  getBy ::
+    forall record m.
+    (MonadIO m, PersistRecordBackend record Backend) =>
+    Unique record ->
+    ReaderT Backend m (Maybe (Entity record))
+  getBy unique = do
+    indexQueryCondition <- throwEither $ encodeUnique unique
+    resp <-
+      either (throwError . InternalError) pure
+        =<< sendRequestEither
+          ( Amazonka.newQuery (tableName @record)
+              & setIndexQueryCondition indexQueryCondition
+          )
+    case resp ^. field @"items" of
+      [] -> pure Nothing
+      [item] -> fmap Just . either throwError pure $ decodeEntity item
+      _ ->
+        throwError . BadEntityImpl $
+          "More than 1 item returned by Query when calling getBy."
+            <> "You probably have a sort key in DDB but not declared in entity"
+
+{-
+When an index is found for input conditions, use Query. Otherwise, use Scan
+Always try to use Query in PersistUniqueRead
+-}
+
+instance PersistQueryRead Backend where
+  selectSourceRes ::
+    (PersistRecordBackend record Backend, MonadIO m1, MonadIO m2) =>
+    [Filter record] ->
+    [SelectOpt record] ->
+    ReaderT Backend m1 (Acquire (ConduitT () (Entity record) m2 ()))
+  selectSourceRes filters opts = undefined
+
+  selectKeysRes ::
+    (MonadIO m1, MonadIO m2, PersistRecordBackend record Backend) =>
+    [Filter record] ->
+    [SelectOpt record] ->
+    ReaderT Backend m1 (Acquire (ConduitT () (Key record) m2 ()))
+  selectKeysRes = undefined
+
+  count ::
+    (MonadIO m, PersistRecordBackend record Backend) =>
+    [Filter record] ->
+    ReaderT Backend m Int
+  count = undefined
+
+  exists ::
+    (MonadIO m, PersistRecordBackend record Backend) =>
+    [Filter record] ->
+    ReaderT Backend m Bool
+  exists = undefined
